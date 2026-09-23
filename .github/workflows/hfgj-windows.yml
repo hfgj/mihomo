@@ -173,7 +173,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.prepare.outputs.release_tag }}
-          prerelease: true
+          prerelease: ${{ github.ref_name == 'hfgj-alpha' }}
           make_latest: false
           generate_release_notes: false
           overwrite_files: true
