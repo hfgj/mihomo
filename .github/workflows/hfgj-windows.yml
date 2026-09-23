@@ -47,7 +47,12 @@ jobs:
               ;;
             hfgj-alpha)
               UPSTREAM_SHA="$(git merge-base HEAD origin/Alpha)"
-              VERSION="alpha-$(git rev-parse --short "${UPSTREAM_SHA}")"
+              VERSION="$(curl -fsSL https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha/version.txt | tr -d '\r\n')"
+              ALPHA_SHA="${VERSION#alpha-}"
+              if [[ "${UPSTREAM_SHA}" != "${ALPHA_SHA}"* ]]; then
+                echo "Fork Alpha base ${UPSTREAM_SHA} does not match published upstream ${VERSION}" >&2
+                exit 1
+              fi
               RELEASE_TAG="HFGJ-Alpha"
               ;;
             *)
