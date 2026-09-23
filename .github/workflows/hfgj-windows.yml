@@ -151,6 +151,13 @@ jobs:
           printf '%s\n' "${{ needs.prepare.outputs.version }}" > bin/version.txt
           ls -lh bin
 
+      - name: Remove previous rolling release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: gh release delete "${TAG}" --yes || true
+
       - name: Move rolling channel tag
         shell: bash
         env:
