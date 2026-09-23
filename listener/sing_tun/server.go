@@ -77,6 +77,12 @@ type ListenerHandler struct {
 
 var emptyAddressSet = []*netipx.IPSet{{}}
 
+// HFGJ: when Windows TUN DNS hijacking is explicitly disabled, keep the
+// virtual adapter DNS empty instead of letting sing-tun install its gateway as DNS.
+func shouldDisableSingTunDNSHijack(goos string, dnsHijack []string) bool {
+	return goos == "windows" && len(dnsHijack) == 0
+}
+
 func CalculateInterfaceName(name string) (tunName string) {
 	if runtime.GOOS == "darwin" {
 		tunName = "utun"
@@ -416,6 +422,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		ExcludeMACAddress:                     excludeMACAddress,
 		FileDescriptor:                        options.FileDescriptor,
 		InterfaceMonitor:                      defaultInterfaceMonitor,
+		EXP_DisableDNSHijack:                 shouldDisableSingTunDNSHijack(runtime.GOOS, options.DNSHijack),
 		EXP_RecvMsgX:                          options.RecvMsgX,
 		EXP_SendMsgX:                          options.SendMsgX,
 		EXP_ProcessorsPerChannel:              options.ProcessorsPerChannel,
