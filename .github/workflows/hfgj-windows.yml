@@ -1,0 +1,175 @@
+name: HFGJ Windows Core
+
+on:
+  push:
+    branches:
+      - hfgj
+      - hfgj-alpha
+    paths:
+      - "listener/sing_tun/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/hfgj-windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "hfgj-windows-${{ github.ref_name }}"
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      upstream_sha: ${{ steps.meta.outputs.upstream_sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve upstream base and HFGJ channel
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin Meta Alpha --tags --force
+
+          case "${GITHUB_REF_NAME}" in
+            hfgj)
+              UPSTREAM_SHA="$(git merge-base HEAD origin/Meta)"
+              VERSION="$(git describe --tags --abbrev=0 "${UPSTREAM_SHA}")"
+              RELEASE_TAG="HFGJ-Stable"
+              ;;
+            hfgj-alpha)
+              UPSTREAM_SHA="$(git merge-base HEAD origin/Alpha)"
+              VERSION="alpha-$(git rev-parse --short "${UPSTREAM_SHA}")"
+              RELEASE_TAG="HFGJ-Alpha"
+              ;;
+            *)
+              echo "Unsupported branch: ${GITHUB_REF_NAME}" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "release_tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "HFGJ channel: ${RELEASE_TAG}"
+          echo "Upstream base: ${UPSTREAM_SHA}"
+          echo "Core version: ${VERSION}"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            goamd64: v2
+            asset: mihomo-windows-amd64-v2
+          - arch: arm64
+            goamd64: ""
+            asset: mihomo-windows-arm64
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up MetaCubeX Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
+          go-version: "1.26"
+
+      - name: Verify HFGJ DNS patch
+        run: go test ./listener/sing_tun -run TestHFGJShouldDisableSingTunDNSHijack -count=1
+
+      - name: Update CA bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates
+          sudo update-ca-certificates
+          cp -f /etc/ssl/certs/ca-certificates.crt component/ca/ca-certificates.crt
+
+      - name: Build Windows core
+        shell: bash
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.arch }}
+          GOAMD64: ${{ matrix.goamd64 }}
+          CGO_ENABLED: "0"
+          GOTOOLCHAIN: local
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          BUILDTIME="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          go build -tags "with_gvisor" -trimpath \
+            -ldflags "-extldflags --static -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid=" \
+            -o "${{ matrix.asset }}.exe"
+          zip -j "${{ matrix.asset }}-${VERSION}.zip" "${{ matrix.asset }}.exe"
+
+      - name: Upload core package
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}-${{ needs.prepare.outputs.version }}.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download Windows core packages
+        uses: actions/download-artifact@v8
+        with:
+          path: bin
+          merge-multiple: true
+
+      - name: Write channel version
+        shell: bash
+        run: |
+          printf '%s\n' "${{ needs.prepare.outputs.version }}" > bin/version.txt
+          ls -lh bin
+
+      - name: Move rolling channel tag
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "${TAG}" "${GITHUB_SHA}"
+          git push origin "refs/tags/${TAG}" --force
+
+      - name: Publish rolling HFGJ core release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          prerelease: true
+          make_latest: false
+          generate_release_notes: false
+          overwrite_files: true
+          body: |
+            HFGJ thin-fork Windows Mihomo core.
+            Upstream base: `${{ needs.prepare.outputs.upstream_sha }}`
+            Core version: `${{ needs.prepare.outputs.version }}`
+
+            Patch scope: on Windows, an explicitly empty `tun.dns-hijack` keeps the TUN adapter DNS empty.
+          files: |
+            bin/*
