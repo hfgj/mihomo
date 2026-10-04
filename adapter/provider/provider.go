@@ -30,6 +30,8 @@ const (
 
 type ProxySchema struct {
 	Proxies []map[string]any `yaml:"proxies"`
+	Hosts   map[string]any   `yaml:"hosts"`
+	DNS     hfgjProviderDNS  `yaml:"dns"`
 }
 
 type providerForApi struct {
@@ -392,6 +394,10 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 		if schema.Proxies == nil {
 			return nil, errors.New("file must have a `proxies` field")
 		}
+		providerResolver, err := newHFGJProviderResolver(schema.Hosts, schema.DNS)
+		if err != nil {
+			return nil, fmt.Errorf("provider DNS: %w", err)
+		}
 
 		proxies := []C.Proxy{}
 		proxiesSet := map[string]struct{}{}
@@ -445,8 +451,17 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 				if err != nil {
 					return nil, fmt.Errorf("proxy %d override error: %w", idx, err)
 				}
+				// Protocols with their own endpoint/QUIC resolver need an explicit
+				// integration; never silently publish partially scoped nodes.
+				if providerResolver != nil {
+					switch mapping["type"] {
+					case "anytls", "trojan", "ss", "ssr", "socks5", "http", "vmess", "vless", "snell":
+					default:
+						return nil, errors.New("provider DNS: unsupported node protocol for scoped resolution")
+					}
+				}
 
-				proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(tunnel), adapter.WithProviderName(pdName))
+				proxy, err := adapter.ParseProxy(mapping, adapter.WithTunnelForAPI(tunnel), adapter.WithProviderName(pdName), adapter.WithProviderResolver(providerResolver))
 				if err != nil {
 					return nil, fmt.Errorf("proxy %d error: %w", idx, err)
 				}

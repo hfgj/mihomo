@@ -55,8 +55,23 @@ type Resolver interface {
 	ResetConnection()
 }
 
+// ScopedResolver owns its hosts lookup. Only explicitly scoped resolvers bypass
+// global hosts; all existing resolvers retain the upstream lookup precedence.
+type ScopedResolver interface {
+	Resolver
+	IsScopedResolver() bool
+}
+
+func isScoped(r Resolver) bool {
+	s, ok := r.(ScopedResolver)
+	return ok && s.IsScopedResolver()
+}
+
 // LookupIPv4WithResolver same as LookupIPv4, but with a resolver
 func LookupIPv4WithResolver(ctx context.Context, host string, r Resolver) ([]netip.Addr, error) {
+	if isScoped(r) {
+		return r.LookupIPv4(ctx, host)
+	}
 	if node, ok := DefaultHosts.Search(host, false); ok {
 		if addrs := utils.Filter(node.IPs, func(ip netip.Addr) bool {
 			return ip.Is4()
@@ -107,6 +122,9 @@ func LookupIPv6WithResolver(ctx context.Context, host string, r Resolver) ([]net
 	if DisableIPv6 {
 		return nil, ErrIPv6Disabled
 	}
+	if isScoped(r) {
+		return r.LookupIPv6(ctx, host)
+	}
 
 	if node, ok := DefaultHosts.Search(host, false); ok {
 		if addrs := utils.Filter(node.IPs, func(ip netip.Addr) bool {
@@ -153,6 +171,12 @@ func ResolveIPv6(ctx context.Context, host string) (netip.Addr, error) {
 
 // LookupIPWithResolver same as LookupIP, but with a resolver
 func LookupIPWithResolver(ctx context.Context, host string, r Resolver) ([]netip.Addr, error) {
+	if isScoped(r) {
+		if DisableIPv6 {
+			return r.LookupIPv4(ctx, host)
+		}
+		return r.LookupIP(ctx, host)
+	}
 	if node, ok := DefaultHosts.Search(host, false); ok {
 		return node.IPs, nil
 	}

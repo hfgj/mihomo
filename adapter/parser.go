@@ -5,6 +5,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/common/structure"
+	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 )
 
@@ -17,9 +18,10 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 
 	opt := applyProxyOptions(options...)
 	basicOption := outbound.BasicOption{
-		DialerForAPI: opt.DialerForAPI,
-		TunnelForAPI: opt.TunnelForAPI,
-		ProviderName: opt.ProviderName,
+		DialerForAPI:     opt.DialerForAPI,
+		TunnelForAPI:     opt.TunnelForAPI,
+		ProviderName:     opt.ProviderName,
+		ProviderResolver: opt.ProviderResolver,
 	}
 
 	var (
@@ -250,9 +252,16 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 }
 
 type proxyOption struct {
-	DialerForAPI C.Dialer
-	TunnelForAPI C.Tunnel
-	ProviderName string
+	DialerForAPI     C.Dialer
+	TunnelForAPI     C.Tunnel
+	ProviderName     string
+	ProviderResolver resolver.Resolver
+}
+
+// WithProviderResolver binds subscription-local node resolution without changing
+// the dialer's socket options or the destination/application resolver.
+func WithProviderResolver(r resolver.Resolver) ProxyOption {
+	return func(opt *proxyOption) { opt.ProviderResolver = r }
 }
 
 func applyProxyOptions(options ...ProxyOption) proxyOption {

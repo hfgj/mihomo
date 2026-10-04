@@ -1307,6 +1307,8 @@ func parseNameServer(servers []string, respectRules bool, preferH3 bool) ([]dns.
 }
 
 func init() {
+	dns.ParseNameServerWithOptions = parseNameServer
+	dns.ProviderDomainMatcher = newHFGJProviderDomainMatcher
 	dns.ParseNameServer = func(servers []string) ([]dns.NameServer, error) { // using by wireguard
 		return parseNameServer(servers, false, false)
 	}

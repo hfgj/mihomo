@@ -637,3 +637,9 @@ func NewResolver(config Config) (rs Resolvers) {
 }
 
 var ParseNameServer func(servers []string) ([]NameServer, error) // define in config/config.go
+
+// ParseNameServerWithOptions reuses config's URI parser for scoped provider DNS.
+var ParseNameServerWithOptions func(servers []string, respectRules, preferH3 bool) ([]NameServer, error)
+
+// ProviderDomainMatcher shares main-config GeoSite/rule-set data, not airport rules.
+var ProviderDomainMatcher func(domain string) (C.DomainMatcher, error)

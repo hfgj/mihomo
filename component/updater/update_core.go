@@ -89,24 +89,20 @@ func (u *CoreUpdater) Update(currentExePath string, channel string, force bool) 
 		return fmt.Errorf("check currentExePath %q: %w", currentExePath, err)
 	}
 
-	baseURL := baseAlphaURL
-	versionURL := versionAlphaURL
-	switch strings.ToLower(channel) {
-	case ReleaseChannel:
-		baseURL = baseReleaseURL
-		versionURL = versionReleaseURL
-	case AlphaChannel:
-		break
-	default: // auto
-		if !strings.HasPrefix(C.Version, "alpha") {
-			baseURL = baseReleaseURL
-			versionURL = versionReleaseURL
-		}
+	source, err := hfgjCoreUpdateSource(channel, C.Version, HFGJReleaseBaseURL, HFGJAlphaBaseURL)
+	if err != nil {
+		return err
 	}
 
-	latestVersion, err := u.getLatestVersion(versionURL)
+	latestVersion, err := u.getLatestVersion(source.versionURL)
 	if err != nil {
 		return fmt.Errorf("get latest version: %w", err)
+	}
+	if source.custom {
+		latestVersion = strings.TrimSpace(latestVersion)
+		if err := hfgjValidateUpdateVersion(latestVersion); err != nil {
+			return err
+		}
 	}
 	log.Infoln("current version %s, latest version %s", C.Version, latestVersion)
 
@@ -125,13 +121,8 @@ func (u *CoreUpdater) Update(currentExePath string, channel string, force bool) 
 
 	// ---- prepare ----
 	mihomoBaseName := u.CoreBaseName()
-	packageName := mihomoBaseName + "-" + latestVersion
-	if runtime.GOOS == "windows" {
-		packageName = packageName + ".zip"
-	} else {
-		packageName = packageName + ".gz"
-	}
-	packageURL := baseURL + packageName
+	packageName := hfgjCorePackageName(mihomoBaseName, latestVersion, runtime.GOOS)
+	packageURL := source.baseURL + packageName
 	log.Infoln("updater: updating using url: %s", packageURL)
 
 	workDir := filepath.Dir(currentExePath)
