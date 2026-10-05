@@ -152,13 +152,22 @@ installed file, version-token validation, linker injection and existing archive
 unpacking. Run the tests along with provider DNS and Windows TUN regressions:
 
 ```
-go test -race -tags with_gvisor ./adapter/provider ./adapter/outbound ./component/resolver ./component/resource ./component/updater ./config ./dns ./listener/sing_tun -count=1
+go test -race -tags with_gvisor ./adapter/provider ./adapter/outbound ./component/resolver ./component/resource ./component/updater ./config ./dns ./listener/sing_tun ./component/dialer ./transport/anytls/session -count=1
 go test -tags with_gvisor ./component/updater -run TestHFGJLinkedCoreSource -count=1 -ldflags "-X github.com/metacubex/mihomo/component/updater.HFGJReleaseBaseURL=https://github.com/hfgj/mihomo/releases/download/HFGJ-Stable/"
 ```
 
 Local validation, cross-compilation and archive checks do not confirm live GitHub
 Actions, an actual release download, Nikki restart, desktop app updates, or
 airport connectivity. Complete those checks after separately approved deployment.
+
+The HFGJ lifecycle fix synchronizes AnyTLS Stream close errors and cleanup hook
+installation, including a hook installed after remote closure. TFO state and
+lazy connection publication are synchronized; concurrent first writes dial once,
+and Close cancels a pending dial and releases a connection returned after Close.
+State locks are released before blocking I/O. A failed lazy dial wakes every
+waiting reader and is terminal for that connection. Tests cover concurrent
+read/write/close, late hooks, blocked I/O, early-data delivery and late-connection
+cleanup. Both lifecycle packages are included in the workflow's race gate.
 
 Maintenance tests use temporary Git remotes and a fake release API, including
 merge conflict, atomic-push rejection, concurrent updates, stale or tampered

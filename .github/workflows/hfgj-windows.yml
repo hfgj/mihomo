@@ -77,7 +77,7 @@ jobs:
           CGO_ENABLED: '1'
           GOTOOLCHAIN: local
         run: |
-          go test -race -tags with_gvisor ./adapter/provider ./adapter/outbound ./component/resolver ./component/resource ./component/updater ./config ./dns ./listener/sing_tun -count=1
+          go test -race -tags with_gvisor ./adapter/provider ./adapter/outbound ./component/resolver ./component/resource ./component/updater ./config ./dns ./listener/sing_tun ./component/dialer ./transport/anytls/session -count=1
           go test -tags with_gvisor ./component/updater -run TestHFGJLinkedCoreSource -count=1 -ldflags '-X github.com/metacubex/mihomo/component/updater.HFGJReleaseBaseURL=https://github.com/hfgj/mihomo/releases/download/HFGJ-Stable/'
 
   build:

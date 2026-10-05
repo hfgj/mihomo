@@ -21,6 +21,7 @@ type Stream struct {
 	writeDeadline pipe.PipeDeadline
 
 	dieOnce sync.Once
+	stateMu sync.Mutex
 	dieHook func()
 	dieErr  error
 
@@ -40,8 +41,8 @@ func newStream(id uint32, sess *Session) *Stream {
 // Read implements net.Conn
 func (s *Stream) Read(b []byte) (n int, err error) {
 	n, err = s.pipeR.Read(b)
-	if n == 0 && s.dieErr != nil {
-		err = s.dieErr
+	if closedErr := s.closedError(); n == 0 && closedErr != nil {
+		err = closedErr
 	}
 	return
 }
@@ -53,8 +54,8 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 		return 0, os.ErrDeadlineExceeded
 	default:
 	}
-	if s.dieErr != nil {
-		return 0, s.dieErr
+	if closedErr := s.closedError(); closedErr != nil {
+		return 0, closedErr
 	}
 	n, err = s.sess.writeDataFrame(s.id, b)
 	return
@@ -69,34 +70,61 @@ func (s *Stream) Close() error {
 func (s *Stream) closeLocally() {
 	var once bool
 	s.dieOnce.Do(func() {
+		s.stateMu.Lock()
 		s.dieErr = net.ErrClosed
+		s.stateMu.Unlock()
 		s.pipeR.Close()
 		once = true
 	})
 	if once {
-		if s.dieHook != nil {
-			s.dieHook()
-			s.dieHook = nil
-		}
+		s.runDieHook()
 	}
 }
 
 func (s *Stream) closeWithError(err error) error {
 	var once bool
 	s.dieOnce.Do(func() {
+		s.stateMu.Lock()
 		s.dieErr = err
+		s.stateMu.Unlock()
 		s.pipeR.Close()
 		once = true
 	})
 	if once {
 		err := s.sess.streamClosed(s.id)
-		if s.dieHook != nil {
-			s.dieHook()
-			s.dieHook = nil
-		}
+		s.runDieHook()
 		return err
 	} else {
-		return s.dieErr
+		return s.closedError()
+	}
+}
+
+func (s *Stream) closedError() error {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	return s.dieErr
+}
+
+// A session can close before CreateStream has installed its cleanup hook.
+func (s *Stream) setDieHook(hook func()) {
+	s.stateMu.Lock()
+	closed := s.dieErr != nil
+	if !closed {
+		s.dieHook = hook
+	}
+	s.stateMu.Unlock()
+	if closed && hook != nil {
+		hook()
+	}
+}
+
+func (s *Stream) runDieHook() {
+	s.stateMu.Lock()
+	hook := s.dieHook
+	s.dieHook = nil
+	s.stateMu.Unlock()
+	if hook != nil {
+		hook()
 	}
 }
 
