@@ -2,185 +2,163 @@ name: HFGJ Core
 
 on:
   push:
-    branches:
-      - hfgj
-      - hfgj-alpha
-    paths:
-      - "listener/sing_tun/**"
-      - "adapter/**"
-      - "component/resolver/**"
-      - "component/resource/**"
-      - "component/updater/**"
-      - "config/**"
-      - "dns/**"
-      - "go.mod"
-      - "go.sum"
-      - ".github/workflows/hfgj-windows.yml"
-      - ".github/scripts/hfgj-package-core.py"
+    branches: [hfgj]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Promote tested Meta merge and publish HFGJ Stable
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      publish:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: "hfgj-core-${{ github.ref_name }}"
-  cancel-in-progress: true
+  group: hfgj-stable-maintenance
+  cancel-in-progress: false
 
 jobs:
   prepare:
+    if: github.repository == 'hfgj/mihomo' && github.ref == 'refs/heads/hfgj'
     runs-on: ubuntu-latest
     outputs:
+      source_sha: ${{ steps.meta.outputs.source_sha }}
       version: ${{ steps.meta.outputs.version }}
-      release_tag: ${{ steps.meta.outputs.release_tag }}
-      upstream_sha: ${{ steps.meta.outputs.upstream_sha }}
+      build_time: ${{ steps.meta.outputs.build_time }}
+      changed: ${{ steps.meta.outputs.changed }}
+      release_needed: ${{ steps.meta.outputs.release_needed }}
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          fetch-tags: true
-
-      - name: Resolve upstream base and HFGJ channel
-        id: meta
-        shell: bash
+      - name: Check maintenance logic before merging upstream
         run: |
-          set -euo pipefail
-          git fetch origin Meta Alpha --tags --force
+          python3 -B -m unittest discover -s .github/scripts/tests -v
+          for script in .github/scripts/hfgj-sync-upstream.sh .github/scripts/hfgj-setup-go.sh; do bash -n "$script" || exit; done
+      - name: Lock Meta merge without changing official refs
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/hfgj-sync-upstream.sh prepare --locked "$RUNNER_TEMP/hfgj-locked"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hfgj-locked-source
+          path: ${{ runner.temp }}/hfgj-locked/
+          if-no-files-found: error
 
-          case "${GITHUB_REF_NAME}" in
-            hfgj)
-              UPSTREAM_SHA="$(git merge-base HEAD origin/Meta)"
-              VERSION="$(git describe --tags --abbrev=0 "${UPSTREAM_SHA}")"
-              RELEASE_TAG="HFGJ-Stable"
-              ;;
-            hfgj-alpha)
-              UPSTREAM_SHA="$(git merge-base HEAD origin/Alpha)"
-              VERSION="$(curl -fsSL https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha/version.txt | tr -d '\r\n')"
-              ALPHA_SHA="${VERSION#alpha-}"
-              if [[ "${UPSTREAM_SHA}" != "${ALPHA_SHA}"* ]]; then
-                echo "Fork Alpha base ${UPSTREAM_SHA} does not match published upstream ${VERSION}" >&2
-                exit 1
-              fi
-              RELEASE_TAG="HFGJ-Alpha"
-              ;;
-            *)
-              echo "Unsupported branch: ${GITHUB_REF_NAME}" >&2
-              exit 1
-              ;;
-          esac
-
-          VERSION="${VERSION}-hfgj.${GITHUB_SHA:0:12}"
-          if [[ ! "${VERSION}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
-            echo "Invalid core version token" >&2
-            exit 1
-          fi
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "release_tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
-          echo "upstream_sha=${UPSTREAM_SHA}" >> "${GITHUB_OUTPUT}"
-          echo "HFGJ channel: ${RELEASE_TAG}"
-          echo "Upstream base: ${UPSTREAM_SHA}"
-          echo "Core version: ${VERSION}"
+  verify:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          name: hfgj-locked-source
+          path: ${{ runner.temp }}/hfgj-locked
+      - name: Check out the locked merge candidate
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          git fetch "$RUNNER_TEMP/hfgj-locked/source.bundle" HEAD
+          test "$(git rev-parse FETCH_HEAD)" = "$SOURCE_SHA"
+          git checkout --detach "$SOURCE_SHA"
+      - name: Set up digest-pinned MetaCubeX Go
+        run: bash .github/scripts/hfgj-setup-go.sh
+      - name: Full affected-package regression, including HFGJ and upstream tests
+        env:
+          CGO_ENABLED: '1'
+          GOTOOLCHAIN: local
+        run: |
+          go test -race -tags with_gvisor ./adapter/provider ./adapter/outbound ./component/resolver ./component/resource ./component/updater ./config ./dns ./listener/sing_tun -count=1
+          go test -tags with_gvisor ./component/updater -run TestHFGJLinkedCoreSource -count=1 -ldflags '-X github.com/metacubex/mihomo/component/updater.HFGJReleaseBaseURL=https://github.com/hfgj/mihomo/releases/download/HFGJ-Stable/'
 
   build:
-    needs: prepare
+    needs: [prepare, verify]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows
-            arch: amd64
-            goamd64: v2
-            asset: mihomo-windows-amd64-v2
-            extension: zip
-          - os: windows
-            arch: arm64
-            goamd64: ""
-            asset: mihomo-windows-arm64
-            extension: zip
-          - os: linux
-            arch: arm64
-            goamd64: ""
-            asset: mihomo-linux-arm64
-            extension: gz
-          - os: darwin
-            arch: arm64
-            goamd64: ""
-            asset: mihomo-darwin-arm64
-            extension: gz
-          - os: darwin
-            arch: amd64
-            goamd64: v1
-            asset: mihomo-darwin-amd64-v1
-            extension: gz
-
+          - {os: windows, arch: amd64, goamd64: v2, asset: mihomo-windows-amd64-v2, extension: zip}
+          - {os: windows, arch: arm64, goamd64: '', asset: mihomo-windows-arm64, extension: zip}
+          - {os: linux, arch: arm64, goamd64: '', asset: mihomo-linux-arm64, extension: gz}
+          - {os: darwin, arch: arm64, goamd64: '', asset: mihomo-darwin-arm64, extension: gz}
+          - {os: darwin, arch: amd64, goamd64: v1, asset: mihomo-darwin-amd64-v1, extension: gz}
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-
-      - name: Set up MetaCubeX Go
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+      - uses: actions/download-artifact@v8
         with:
-          go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
-          go-version: "1.26"
-
-      - name: Verify HFGJ DNS patch
-        run: go test ./listener/sing_tun -run TestHFGJShouldDisableSingTunDNSHijack -count=1
-
-      - name: Verify HFGJ provider DNS patch
+          name: hfgj-locked-source
+          path: ${{ runner.temp }}/hfgj-locked
+      - name: Check out the locked merge candidate
         env:
-          CGO_ENABLED: "1"
-        run: go test -race -tags with_gvisor ./adapter/provider ./adapter/outbound ./component/resolver ./component/resource ./component/updater -run TestHFGJ -count=1
-
-      - name: Verify injected update source
-        if: github.ref_name == 'hfgj'
-        run: go test ./component/updater -run TestHFGJLinkedCoreSource -count=1 -ldflags "-X github.com/metacubex/mihomo/component/updater.HFGJReleaseBaseURL=https://github.com/${{ github.repository }}/releases/download/HFGJ-Stable/"
-
-      - name: Update CA bundle
-        shell: bash
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
         run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ca-certificates
-          sudo update-ca-certificates
-          cp -f /etc/ssl/certs/ca-certificates.crt component/ca/ca-certificates.crt
-
-      - name: Build and package core
-        shell: bash
+          git fetch "$RUNNER_TEMP/hfgj-locked/source.bundle" HEAD
+          test "$(git rev-parse FETCH_HEAD)" = "$SOURCE_SHA"
+          git checkout --detach "$SOURCE_SHA"
+      - name: Set up digest-pinned MetaCubeX Go
+        run: bash .github/scripts/hfgj-setup-go.sh
+      - name: Build using locked source time and committed CA bundle
         env:
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
           GOAMD64: ${{ matrix.goamd64 }}
-          CGO_ENABLED: "0"
           GOARM64: v8.0
+          CGO_ENABLED: '0'
           GOTOOLCHAIN: local
           VERSION: ${{ needs.prepare.outputs.version }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
-          CORE_REPOSITORY: ${{ github.repository }}
+          BUILDTIME: ${{ needs.prepare.outputs.build_time }}
           ASSET: ${{ matrix.asset }}
         run: |
           set -euo pipefail
-          BUILDTIME="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-          SOURCE_SYMBOL=HFGJReleaseBaseURL
-          if [[ "${RELEASE_TAG}" == "HFGJ-Alpha" ]]; then
-            SOURCE_SYMBOL=HFGJAlphaBaseURL
-          fi
-          BINARY="${ASSET}"
-          if [[ "${GOOS}" == "windows" ]]; then BINARY="${BINARY}.exe"; fi
-          go build -tags "with_gvisor" -trimpath \
-            -ldflags "-extldflags --static -X github.com/metacubex/mihomo/constant.Version=${VERSION} -X github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME} -X github.com/metacubex/mihomo/component/updater.${SOURCE_SYMBOL}=https://github.com/${CORE_REPOSITORY}/releases/download/${RELEASE_TAG}/ -w -s -buildid=" \
-            -o "${BINARY}"
-          python3 .github/scripts/hfgj-package-core.py "${BINARY}" "${VERSION}" --output bin
-
-      - name: Upload core package
-        uses: actions/upload-artifact@v7
+          BINARY="$ASSET"
+          if [ "$GOOS" = windows ]; then BINARY="$BINARY.exe"; fi
+          go build -tags with_gvisor -trimpath \
+            -ldflags "-extldflags --static -X github.com/metacubex/mihomo/constant.Version=$VERSION -X github.com/metacubex/mihomo/constant.BuildTime=$BUILDTIME -X github.com/metacubex/mihomo/component/updater.HFGJReleaseBaseURL=https://github.com/hfgj/mihomo/releases/download/HFGJ-Stable/ -w -s -buildid=" \
+            -o "$BINARY"
+          python3 .github/scripts/hfgj-package-core.py "$BINARY" "$VERSION" --output bin
+      - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.asset }}
+          name: core-${{ matrix.asset }}
           path: bin/${{ matrix.asset }}-${{ needs.prepare.outputs.version }}.${{ matrix.extension }}
           if-no-files-found: error
 
-  publish:
+  assemble:
     needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: hfgj-locked-source
+          path: ${{ runner.temp }}/hfgj-locked
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: core-*
+          merge-multiple: true
+          path: bin
+      - name: Inspect every package and generate manifest
+        run: python3 .github/scripts/hfgj-release.py assemble --locked "$RUNNER_TEMP/hfgj-locked" --packages bin
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hfgj-release-preview
+          path: bin/
+          if-no-files-found: error
+
+  promote:
+    needs: [prepare, assemble]
+    if: inputs.publish || (github.event_name == 'push' && vars.HFGJ_AUTO_PUBLISH == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -188,54 +166,37 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-
-      - name: Download core packages
-        uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v8
         with:
+          name: hfgj-locked-source
+          path: ${{ runner.temp }}/hfgj-locked
+      - name: Atomically fast-forward Meta and promote this tested candidate
+        run: bash .github/scripts/hfgj-sync-upstream.sh promote --locked "$RUNNER_TEMP/hfgj-locked"
+
+  publish:
+    needs: [prepare, promote]
+    if: needs.prepare.outputs.release_needed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: hfgj-locked-source
+          path: ${{ runner.temp }}/hfgj-locked
+      - uses: actions/download-artifact@v8
+        with:
+          name: hfgj-release-preview
           path: bin
-          merge-multiple: true
-
-      - name: Write channel version
-        shell: bash
-        run: |
-          printf '%s\n' "${{ needs.prepare.outputs.version }}" > bin/version.txt
-          (cd bin && sha256sum *.zip *.gz version.txt > SHA256SUMS)
-          ls -lh bin
-
-      - name: Remove previous rolling release
-        shell: bash
+      - name: Publish these exact packages; preserve old channel on failure
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.prepare.outputs.release_tag }}
-        run: gh release delete "${TAG}" --yes || true
-
-      - name: Move rolling channel tag
-        shell: bash
-        env:
-          TAG: ${{ needs.prepare.outputs.release_tag }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -f "${TAG}" "${GITHUB_SHA}"
-          git push origin "refs/tags/${TAG}" --force
-
-      - name: Publish rolling HFGJ core release
-        uses: softprops/action-gh-release@v3
+        run: python3 .github/scripts/hfgj-release.py publish --locked "$RUNNER_TEMP/hfgj-locked" --packages bin --backup "$RUNNER_TEMP/hfgj-channel-recovery"
+      - name: Keep public channel recovery metadata even on failure
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
-          tag_name: ${{ needs.prepare.outputs.release_tag }}
-          prerelease: ${{ github.ref_name == 'hfgj-alpha' }}
-          make_latest: false
-          generate_release_notes: false
-          overwrite_files: true
-          body: |
-            HFGJ thin-fork Mihomo core for Windows, Linux ARM64 and macOS.
-            Upstream base: `${{ needs.prepare.outputs.upstream_sha }}`
-            Core version: `${{ needs.prepare.outputs.version }}`
-
-            Provider-local hosts and explicit node DNS are applied from the same subscription response, without importing airport rules or modifying global DNS.
-            Core-managed updates use this HFGJ channel. Version tokens include the HFGJ commit so patch-only updates are detectable.
-            On Windows, an explicitly empty `tun.dns-hijack` keeps the TUN adapter DNS empty.
-            OpenWrt package feeds and desktop application download sources are managed separately.
-          files: |
-            bin/*
+          name: hfgj-channel-recovery
+          path: ${{ runner.temp }}/hfgj-channel-recovery/
+          if-no-files-found: warn

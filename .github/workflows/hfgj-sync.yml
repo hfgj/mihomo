@@ -1,0 +1,17 @@
+name: HFGJ daily Meta maintenance
+on:
+  schedule:
+    - cron: '17 3 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: hfgj-daily-meta-dispatch
+  cancel-in-progress: false
+jobs:
+  maintain:
+    if: github.repository == 'hfgj/mihomo' && vars.HFGJ_AUTO_SYNC == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/hfgj-windows.yml
+    with:
+      publish: ${{ vars.HFGJ_AUTO_PUBLISH == 'true' }}
