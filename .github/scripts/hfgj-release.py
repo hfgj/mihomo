@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +29,42 @@ TARGETS = {
 SHA = re.compile(r"[0-9a-f]{40}")
 VERSION = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+-hfgj\.[0-9a-f]{12}")
 LIMIT = 32 * 1024 * 1024
+VERIFY_DELAYS = (0, 1, 2, 4, 8)
+
+def safe_error(error):
+    """Keep useful diagnostics without headers, credentials or response bodies."""
+    result = {"type": type(error).__name__}
+    if isinstance(error, urllib.error.HTTPError):
+        result["status"] = error.code
+    elif isinstance(error, urllib.error.URLError):
+        result["reason_type"] = type(error.reason).__name__
+    elif isinstance(error, ValueError):
+        result["message"] = str(error)
+    if error.__cause__ is not None:
+        result["cause"] = safe_error(error.__cause__)
+    return result
+
+def verify_download(client, asset, data):
+    expected = digest(data)
+    api_digest = asset.get("digest")
+    if api_digest and api_digest != "sha256:" + expected:
+        raise ValueError("Uploaded asset API digest differs")
+    last = None
+    for attempt, delay in enumerate(VERIFY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            # A distinct public URL avoids reusing a stale redirect after rename.
+            if client.download(asset, cache_key=expected + "-" + str(attempt)) == data:
+                return
+            last = ValueError("Uploaded asset bytes differ")
+        except urllib.error.HTTPError as error:
+            if error.code not in (404, 408, 429, 500, 502, 503, 504):
+                raise
+            last = error
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+            last = error
+    raise ValueError("Public asset verification exhausted after five attempts: " + asset["name"]) from last
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
@@ -232,11 +269,15 @@ class GitHub:
         url = release["upload_url"].split("{", 1)[0] + "?name=" + urllib.parse.quote(name, safe="")
         return self.request(url, "POST", data, "application/octet-stream")
 
-    def download(self, asset):
+    def download(self, asset, *, cache_key=None):
         url = asset["browser_download_url"]
         prefix = f"https://github.com/{REPOSITORY}/releases/download/{CHANNEL}/"
         if not url.startswith(prefix):
             raise ValueError("Unexpected public release URL")
+        if cache_key is not None:
+            if not re.fullmatch(r"[0-9a-f]{64}-[0-9]+", cache_key):
+                raise ValueError("Invalid public verification cache key")
+            url += ("&" if "?" in url else "?") + "hfgj_verify=" + cache_key
         req = urllib.request.Request(url, headers={"User-Agent": "hfgj-maintenance",
                                                    "Cache-Control": "no-cache"})
         with urllib.request.urlopen(req, timeout=60) as response:
@@ -293,11 +334,7 @@ def publish(client, directory, meta, backup):
         {"release_id": release["id"], "tag_sha": old_tag, "body": release.get("body")}, indent=2) + "\n")
 
     def verify(asset, data):
-        api_digest = asset.get("digest")
-        if api_digest and api_digest != "sha256:" + digest(data):
-            raise ValueError("Uploaded asset API digest differs")
-        if client.download(asset) != data:
-            raise ValueError("Uploaded asset bytes differ")
+        verify_download(client, asset, data)
 
     def ensure(name, data):
         if name in assets:
@@ -343,30 +380,38 @@ def publish(client, directory, meta, backup):
         raise ValueError("hfgj changed during upload")
     if client.api("/git/ref/tags/" + CHANNEL)["object"]["sha"] != old_tag:
         raise ValueError("Channel tag changed during upload")
+    phase = "replace-checksums"
     try:
         replace("SHA256SUMS", sums, meta["source_sha"][:12])
+        phase = "move-channel-tag"
         client.api("/git/refs/tags/" + CHANNEL, "PATCH", {"sha": meta["source_sha"], "force": True})
+        phase = "update-release-body"
         client.api("/releases/" + str(release["id"]), "PATCH", {
             "body": f"HFGJ Stable\nCore: {meta['version']}\nSource: {meta['source_sha']}\n"
                     f"Upstream Meta: {meta['upstream_sha']}\nStable ancestor: {meta['upstream_tag']}\n"})
+        phase = "replace-version"
         replace("version.txt", version_data, meta["source_sha"][:12])
     except Exception as original:
         errors = []
         for name in ("SHA256SUMS", "version.txt"):
             try:
                 replace(name, old[name], "restore-" + meta["source_sha"][:12])
-            except Exception:
-                errors.append(name)
+            except Exception as recovery_error:
+                errors.append({"operation": name, "error": safe_error(recovery_error)})
         for path, data in (
             ("/git/refs/tags/" + CHANNEL, {"sha": old_tag, "force": True}),
             ("/releases/" + str(release["id"]), {"body": release.get("body")})):
             try:
                 client.api(path, "PATCH", data)
-            except Exception:
-                errors.append(path)
+            except Exception as recovery_error:
+                errors.append({"operation": path, "error": safe_error(recovery_error)})
+        diagnostic = {"phase": phase, "original_error": safe_error(original),
+                      "recovery_errors": errors}
+        (backup / "failure.json").write_text(json.dumps(diagnostic, indent=2) + "\n")
+        detail = json.dumps(diagnostic)
         if errors:
-            raise ValueError("Publish failed; metadata recovery incomplete; keep recovery artifact") from original
-        raise ValueError("Publish failed; previous channel metadata restored") from original
+            raise ValueError("Publish failed; metadata recovery incomplete; keep recovery artifact; " + detail) from original
+        raise ValueError("Publish failed; previous channel metadata restored; " + detail) from original
     return {"status": "published", "version": meta["version"], "source_sha": meta["source_sha"]}
 
 def main():

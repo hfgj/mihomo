@@ -7,6 +7,8 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
+import urllib.error
 import zipfile
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'hfgj-release.py'
@@ -95,7 +97,7 @@ class FakeGitHub:
         if name in self.assets: raise AssertionError('duplicate upload name')
         return self.add(name,data)
 
-    def download(self, asset):
+    def download(self, asset, *, cache_key=None):
         return self.assets[asset['name']]['data']
 
 
@@ -134,6 +136,47 @@ class ReleaseTests(unittest.TestCase):
         self.client.failure='rename-version'
         with self.assertRaisesRegex(ValueError,'previous channel metadata restored'): self.run_publish()
         self.assert_old_channel()
+
+    def test_rename_propagation_delay_succeeds_without_rollback(self):
+        original=self.client.download; counts={}
+        def lagged(asset, **kwargs):
+            name=asset['name']; counts[name]=counts.get(name,0)+1
+            data=original(asset,**kwargs)
+            if kwargs and name in ('SHA256SUMS','version.txt') and counts[name]<=3:
+                return b'stale cached data'
+            return data
+        with patch.object(self.client,'download',side_effect=lagged), patch.object(m.time,'sleep'):
+            self.assertEqual(self.run_publish()['status'],'published')
+        self.assertFalse((self.root/'recovery/failure.json').exists())
+        self.assertEqual(self.client.tag,self.meta['source_sha'])
+
+    def test_persistent_version_staleness_restores_and_records_cause(self):
+        original=self.client.download
+        def stale(asset, **kwargs):
+            data=original(asset,**kwargs)
+            if asset['name']=='version.txt' and data!=self.client.old_version:
+                return self.client.old_version
+            return data
+        with patch.object(self.client,'download',side_effect=stale), patch.object(m.time,'sleep'):
+            with self.assertRaisesRegex(ValueError,'previous channel metadata restored'): self.run_publish()
+        self.assert_old_channel()
+        diagnostic=json.loads((self.root/'recovery/failure.json').read_text())
+        self.assertEqual(diagnostic['phase'],'replace-version')
+        self.assertEqual(diagnostic['original_error']['cause']['message'],'Uploaded asset bytes differ')
+        self.assertEqual(diagnostic['recovery_errors'],[])
+
+    def test_recovery_http_error_preserves_original_diagnostic(self):
+        self.client.failure='rename-version'; original=self.client.api
+        def failing(path, method='GET', data=None):
+            if method=='PATCH' and path=='/git/refs/tags/HFGJ-Stable' and data['sha']==self.meta['base_sha']:
+                raise urllib.error.HTTPError('https://example.invalid/secret',403,'private-detail',None,None)
+            return original(path,method,data)
+        with patch.object(self.client,'api',side_effect=failing):
+            with self.assertRaisesRegex(ValueError,'recovery incomplete'): self.run_publish()
+        diagnostic=json.loads((self.root/'recovery/failure.json').read_text())
+        self.assertEqual(diagnostic['original_error']['type'],'RuntimeError')
+        self.assertEqual(diagnostic['recovery_errors'][0]['error'],{'type':'HTTPError','status':403})
+        self.assertNotIn('private-detail',json.dumps(diagnostic))
 
     def test_stale_source_refuses_all_writes(self):
         self.client.source='9'*40
@@ -210,6 +253,65 @@ class ReleaseTests(unittest.TestCase):
     def test_alpha_metadata_is_refused(self):
         self.meta['channel']='HFGJ-Alpha'
         with self.assertRaises(ValueError): self.run_publish()
+
+
+class DownloadTests(unittest.TestCase):
+    def setUp(self):
+        self.asset={'name':'SHA256SUMS','digest':'sha256:'+m.digest(b'expected')}
+
+    def test_transient_http_and_stale_bytes_retry_then_succeed(self):
+        from unittest.mock import Mock
+        client=Mock(); client.download.side_effect=[
+            urllib.error.HTTPError('public',404,'not yet visible',None,None),
+            urllib.error.HTTPError('public',503,'unavailable',None,None),b'stale',b'expected']
+        with patch.object(m.time,'sleep') as sleep:
+            m.verify_download(client,self.asset,b'expected')
+        self.assertEqual(client.download.call_count,4)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list],[1,2,4])
+        keys=[call.kwargs['cache_key'] for call in client.download.call_args_list]
+        self.assertEqual(len(set(keys)),4)
+
+    def test_permanent_http_error_is_not_retried(self):
+        from unittest.mock import Mock
+        client=Mock(); client.download.side_effect=urllib.error.HTTPError('public',403,'forbidden',None,None)
+        with patch.object(m.time,'sleep') as sleep:
+            with self.assertRaises(urllib.error.HTTPError):m.verify_download(client,self.asset,b'expected')
+        self.assertEqual(client.download.call_count,1);sleep.assert_not_called()
+
+    def test_api_digest_conflict_is_not_retried_or_downloaded(self):
+        from unittest.mock import Mock
+        client=Mock();self.asset['digest']='sha256:'+'0'*64
+        with self.assertRaisesRegex(ValueError,'API digest differs'):m.verify_download(client,self.asset,b'expected')
+        client.download.assert_not_called()
+
+    def test_network_errors_have_bounded_retries_and_safe_diagnostics(self):
+        from unittest.mock import Mock
+        client=Mock();client.download.side_effect=urllib.error.URLError('sensitive remote reason')
+        with patch.object(m.time,'sleep') as sleep:
+            with self.assertRaisesRegex(ValueError,'five attempts') as error:m.verify_download(client,self.asset,b'expected')
+        self.assertEqual(client.download.call_count,5)
+        self.assertEqual(sum(call.args[0] for call in sleep.call_args_list),15)
+        diagnostic=m.safe_error(error.exception)
+        self.assertEqual(diagnostic['cause']['type'],'URLError')
+        self.assertNotIn('sensitive remote reason',json.dumps(diagnostic))
+
+    def test_download_cache_key_uses_public_url_without_credentials(self):
+        client=m.GitHub('test-private-token')
+        asset={'browser_download_url':'https://github.com/hfgj/mihomo/releases/download/HFGJ-Stable/version.txt'}
+        key=m.digest(b'expected')+'-1'
+        with patch.object(m.urllib.request,'urlopen',return_value=io.BytesIO(b'expected')) as opened:
+            self.assertEqual(client.download(asset,cache_key=key),b'expected')
+        request=opened.call_args.args[0]
+        self.assertTrue(request.full_url.endswith('?hfgj_verify='+key))
+        self.assertIsNone(request.get_header('Authorization'))
+        self.assertNotIn('test-private-token',request.full_url)
+
+    def test_invalid_cache_key_refused_before_request(self):
+        client=m.GitHub('test-private-token')
+        asset={'browser_download_url':'https://github.com/hfgj/mihomo/releases/download/HFGJ-Stable/version.txt'}
+        with patch.object(m.urllib.request,'urlopen') as opened:
+            with self.assertRaisesRegex(ValueError,'cache key'):client.download(asset,cache_key='unexpected&other=value')
+        opened.assert_not_called()
 
 
 class GitTests(unittest.TestCase):

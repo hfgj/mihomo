@@ -67,6 +67,16 @@ short deletion/rename window and is not an atomic transaction. Failed metadata
 changes trigger restoration and save public recovery metadata as an artifact;
 an incomplete restoration fails visibly and requires manual repair.
 
+Public downloads used to verify uploaded or renamed assets use a digest/attempt
+query key and at most five attempts, with waits of 1, 2, 4 and 8 seconds.
+Transient HTTP 404/408/429/500/502/503/504, network errors and stale downloaded
+bytes can be retried. Conflicting API digests and permanent HTTP errors fail
+immediately. Uploads, deletions, renames and tag/body writes are not retried.
+Failure recovery saves `failure.json` with the publication phase, original
+exception type/HTTP status and individual recovery errors; diagnostics exclude
+request headers, credentials and response bodies. A download that remains
+inconsistent after the limit still fails and invokes the existing restoration.
+
 ## Meta maintenance
 
 `.github/workflows/hfgj-sync.yml` checks official Meta daily at 03:17 UTC
