@@ -98,7 +98,7 @@ func (p *Proxy) ExtraDelayHistories() map[string]C.ProxyState {
 		state := v
 
 		queueM := state.history.Copy()
-		var history []C.DelayHistory
+		history := make([]C.DelayHistory, 0, len(queueM))
 
 		for _, item := range queueM {
 			history = append(history, item)
